@@ -26,6 +26,8 @@
 
 #include <atomic>
 #include <memory>
+#include <optional>
+#include <vector>
 
 #include "src/core/lib/event_engine/thread_pool/thread_count.h"
 #include "src/core/lib/event_engine/thread_pool/thread_pool.h"
@@ -34,6 +36,7 @@
 #include "src/core/util/backoff.h"
 #include "src/core/util/notification.h"
 #include "src/core/util/sync.h"
+#include "src/core/util/thd.h"
 #include "src/core/util/time.h"
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_set.h"
@@ -47,7 +50,8 @@ class WorkStealingThreadPool final : public ThreadPool {
   // Asserts Quiesce was called.
   ~WorkStealingThreadPool() override;
   // Shut down the pool, and wait for all threads to exit.
-  // This method is safe to call from within a ThreadPool thread.
+  // This includes thread-local destructors, except for the calling thread when
+  // called from a worker of this pool.
   void Quiesce() override;
   // Run must not be called after Quiesce completes
   void Run(absl::AnyInvocable<void()> callback) override;
@@ -61,6 +65,8 @@ class WorkStealingThreadPool final : public ThreadPool {
 #endif  // GRPC_ENABLE_FORK_SUPPORT
 
  private:
+  class ThreadState;
+
   // A basic communication mechanism to signal waiting threads that work is
   // available.
   class WorkSignal {
@@ -113,6 +119,7 @@ class WorkStealingThreadPool final : public ThreadPool {
     // threads created to populate the initial pool are not rate-limited, but
     // all others thread creation scenarios are rate-limited.
     void StartThread();
+    void RetireThread(grpc_core::Thread thread);
     // Shut down the pool, and wait for all threads to exit.
     // This method is safe to call from within a ThreadPool thread.
     void Quiesce();
@@ -145,6 +152,22 @@ class WorkStealingThreadPool final : public ThreadPool {
     WorkSignal* work_signal() { return &work_signal_; }
 
    private:
+    // Join retired workers without blocking the lifeguard's scaling decisions.
+    class WorkerReaper {
+     public:
+      WorkerReaper();
+      ~WorkerReaper();
+      void Add(grpc_core::Thread thread);
+
+     private:
+      void Run();
+      grpc_core::Mutex mu_;
+      grpc_core::CondVar cv_ ABSL_GUARDED_BY(mu_);
+      std::vector<grpc_core::Thread> pending_ ABSL_GUARDED_BY(mu_);
+      bool stopping_ ABSL_GUARDED_BY(mu_) = false;
+      grpc_core::Thread thread_;
+    };
+
     // Lifeguard monitors the pool and keeps it healthy.
     // It has two main responsibilities:
     //  * scale the pool to match demand.
@@ -164,10 +187,8 @@ class WorkStealingThreadPool final : public ThreadPool {
 
       WorkStealingThreadPoolImpl* pool_;
       grpc_core::BackOff backoff_;
-      // Used for signaling that the lifeguard thread has stopped running.
       std::unique_ptr<grpc_core::Notification> lifeguard_should_shut_down_;
-      std::unique_ptr<grpc_core::Notification> lifeguard_is_shut_down_;
-      std::atomic<bool> lifeguard_running_{false};
+      grpc_core::Thread thread_;
     };
 
     void DumpStacksAndCrash();
@@ -190,7 +211,10 @@ class WorkStealingThreadPool final : public ThreadPool {
     std::atomic<bool> throttled_{false};
     WorkSignal work_signal_;
     grpc_core::Mutex lifeguard_ptr_mu_;
+    grpc_core::CondVar startup_cv_ ABSL_GUARDED_BY(lifeguard_ptr_mu_);
     std::unique_ptr<Lifeguard> lifeguard_ ABSL_GUARDED_BY(lifeguard_ptr_mu_);
+    // Created before workers start; destroyed only after their bodies stop.
+    std::unique_ptr<WorkerReaper> worker_reaper_;
     // Set of threads for verbose failure debugging
     grpc_core::Mutex thd_set_mu_;
     absl::flat_hash_set<gpr_thd_id> thds_ ABSL_GUARDED_BY(thd_set_mu_);
@@ -199,6 +223,9 @@ class WorkStealingThreadPool final : public ThreadPool {
   class ThreadState {
    public:
     explicit ThreadState(std::shared_ptr<WorkStealingThreadPoolImpl> pool);
+    void Start();
+    static ThreadState* Current(WorkStealingThreadPoolImpl* pool);
+    void ScheduleJoinFromHelper();
     void ThreadBody();
     void SleepIfRunning();
     bool Step();
@@ -216,6 +243,8 @@ class WorkStealingThreadPool final : public ThreadPool {
     LivingThreadCount::AutoThreadCounter auto_thread_counter_;
     grpc_core::BackOff backoff_;
     size_t busy_count_idx_;
+    std::optional<grpc_core::Thread> thread_;
+    static thread_local ThreadState* current_;
   };
 
   const std::shared_ptr<WorkStealingThreadPoolImpl> pool_;

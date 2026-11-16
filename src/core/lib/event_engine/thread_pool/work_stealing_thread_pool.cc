@@ -25,8 +25,8 @@
 #include <chrono>
 #include <cstddef>
 #include <memory>
-#include <optional>
 #include <utility>
+#include <vector>
 
 #include "src/core/lib/debug/trace.h"
 #include "src/core/lib/event_engine/common_closures.h"
@@ -90,9 +90,8 @@
 //        Start the worker threads
 //
 // Thread 2 will find no worker threads, and it will then want to wait on a
-// non-existent Lifeguard thread to finish. Trying a simple
-// `lifeguard_thread_.Join()` leads to memory access errors. This implementation
-// uses Notifications to coordinate startup and shutdown states.
+// non-existent Lifeguard thread to finish. Startup and final shutdown are
+// serialized by lifeguard_ptr_mu_ so that shutdown cannot miss new threads.
 //
 // ## Debugging
 //
@@ -113,8 +112,6 @@ namespace {
 // Maximum amount of time an extra thread is allowed to idle before being
 // reclaimed.
 constexpr auto kIdleThreadLimit = std::chrono::seconds(20);
-// Rate at which "Waiting for ..." logs should be printed while quiescing.
-constexpr size_t kBlockingQuiesceLogRateSeconds = 3;
 // Minimum time between thread creations.
 constexpr grpc_core::Duration kTimeBetweenThrottledThreadStarts =
     grpc_core::Duration::Seconds(1);
@@ -237,11 +234,14 @@ WorkStealingThreadPool::WorkStealingThreadPoolImpl::WorkStealingThreadPoolImpl(
     : reserve_threads_(reserve_threads), queue_(this) {}
 
 void WorkStealingThreadPool::WorkStealingThreadPoolImpl::Start() {
+  grpc_core::MutexLock lock(lifeguard_ptr_mu_);
+  if (IsQuiesced()) return;
+  worker_reaper_ = std::make_unique<WorkerReaper>();
   for (size_t i = 0; i < reserve_threads_; i++) {
     StartThread();
   }
-  grpc_core::MutexLock lock(lifeguard_ptr_mu_);
   lifeguard_ = std::make_unique<Lifeguard>(this);
+  startup_cv_.SignalAll();
 }
 
 void WorkStealingThreadPool::WorkStealingThreadPoolImpl::Run(
@@ -261,16 +261,12 @@ void WorkStealingThreadPool::WorkStealingThreadPoolImpl::StartThread() {
   last_started_thread_.store(
       grpc_core::Timestamp::Now().milliseconds_after_process_epoch(),
       std::memory_order_relaxed);
-  grpc_core::Thread(
-      "event_engine",
-      [](void* arg) {
-        ThreadState* worker = static_cast<ThreadState*>(arg);
-        worker->ThreadBody();
-        delete worker;
-      },
-      new ThreadState(shared_from_this()), nullptr,
-      grpc_core::Thread::Options().set_tracked(false).set_joinable(false))
-      .Start();
+  (new ThreadState(shared_from_this()))->Start();
+}
+
+void WorkStealingThreadPool::WorkStealingThreadPoolImpl::RetireThread(
+    grpc_core::Thread thread) {
+  worker_reaper_->Add(std::move(thread));
 }
 
 void WorkStealingThreadPool::WorkStealingThreadPoolImpl::Quiesce() {
@@ -279,19 +275,37 @@ void WorkStealingThreadPool::WorkStealingThreadPoolImpl::Quiesce() {
   // Note that if this is a threadpool thread then we won't exit this thread
   // until all other threads have exited, so we need to wait for just one thread
   // running instead of zero.
-  bool is_threadpool_thread = g_local_queue != nullptr;
+  auto* current = ThreadState::Current(this);
+  const size_t target_thread_count = current != nullptr ? 1 : 0;
   work_signal()->SignalAll();
   auto threads_were_shut_down = living_thread_count_.BlockUntilThreadCount(
-      is_threadpool_thread ? 1 : 0, "shutting down",
+      target_thread_count, "shutting down",
       g_log_verbose_failures ? kBlockUntilThreadCountTimeout
                              : grpc_core::Duration::Infinity());
   if (!threads_were_shut_down.ok() && g_log_verbose_failures) {
     DumpStacksAndCrash();
   }
-  GRPC_CHECK(queue_.Empty());
-  quiesced_.store(true, std::memory_order_relaxed);
   grpc_core::MutexLock lock(lifeguard_ptr_mu_);
+  // A suspended fork generation must restart before its saved work can drain.
+  while (worker_reaper_ == nullptr) startup_cv_.Wait(&lifeguard_ptr_mu_);
+  // A zero-reserve pool may have queued work but no worker to drain it yet.
+  if (!queue_.Empty() && living_thread_count_.count() == target_thread_count) {
+    StartThread();
+  }
+  threads_were_shut_down = living_thread_count_.BlockUntilThreadCount(
+      target_thread_count, "draining restarted workers",
+      grpc_core::Duration::Infinity());
+  GRPC_CHECK(threads_were_shut_down.ok());
+  quiesced_.store(true, std::memory_order_relaxed);
   lifeguard_.reset();
+  // The lifeguard may have been creating a worker when the count reached zero.
+  threads_were_shut_down = living_thread_count_.BlockUntilThreadCount(
+      target_thread_count, "finishing shutdown",
+      grpc_core::Duration::Infinity());
+  GRPC_CHECK(threads_were_shut_down.ok());
+  GRPC_CHECK(queue_.Empty());
+  worker_reaper_.reset();
+  if (current != nullptr) current->ScheduleJoinFromHelper();
 }
 
 bool WorkStealingThreadPool::WorkStealingThreadPoolImpl::SetThrottled(
@@ -334,8 +348,13 @@ void WorkStealingThreadPool::WorkStealingThreadPoolImpl::PrepareFork() {
   if (!threads_were_shut_down.ok() && g_log_verbose_failures) {
     DumpStacksAndCrash();
   }
+  GRPC_CHECK(threads_were_shut_down.ok());
   grpc_core::MutexLock lock(lifeguard_ptr_mu_);
   lifeguard_.reset();
+  threads_were_shut_down = living_thread_count_.BlockUntilThreadCount(
+      0, "finishing fork preparation", grpc_core::Duration::Infinity());
+  GRPC_CHECK(threads_were_shut_down.ok());
+  worker_reaper_.reset();
 }
 
 void WorkStealingThreadPool::WorkStealingThreadPoolImpl::Postfork() {
@@ -373,6 +392,49 @@ void WorkStealingThreadPool::WorkStealingThreadPoolImpl::DumpStacksAndCrash() {
       "Pool did not quiesce in time, gRPC will not shut down cleanly.");
 }
 
+// -------- WorkStealingThreadPool::WorkStealingThreadPoolImpl::WorkerReaper --
+
+WorkStealingThreadPool::WorkStealingThreadPoolImpl::WorkerReaper::
+    WorkerReaper() {
+  bool success;
+  thread_ = grpc_core::Thread(
+      "event_engine_reaper",
+      [](void* arg) { static_cast<WorkerReaper*>(arg)->Run(); }, this, &success,
+      grpc_core::Thread::Options().set_tracked(false));
+  GRPC_CHECK(success);
+  thread_.Start();
+}
+
+void WorkStealingThreadPool::WorkStealingThreadPoolImpl::WorkerReaper::Add(
+    grpc_core::Thread thread) {
+  grpc_core::MutexLock lock(mu_);
+  pending_.push_back(std::move(thread));
+  cv_.Signal();
+}
+
+void WorkStealingThreadPool::WorkStealingThreadPoolImpl::WorkerReaper::Run() {
+  while (true) {
+    std::vector<grpc_core::Thread> pending;
+    {
+      grpc_core::MutexLock lock(mu_);
+      while (pending_.empty() && !stopping_) cv_.Wait(&mu_);
+      if (pending_.empty()) return;
+      pending.swap(pending_);
+    }
+    for (auto& thread : pending) thread.Join();
+  }
+}
+
+WorkStealingThreadPool::WorkStealingThreadPoolImpl::WorkerReaper::
+    ~WorkerReaper() {
+  {
+    grpc_core::MutexLock lock(mu_);
+    stopping_ = true;
+    cv_.Signal();
+  }
+  thread_.Join();
+}
+
 // -------- WorkStealingThreadPool::WorkStealingThreadPoolImpl::Lifeguard -----
 
 WorkStealingThreadPool::WorkStealingThreadPoolImpl::Lifeguard::Lifeguard(
@@ -382,12 +444,7 @@ WorkStealingThreadPool::WorkStealingThreadPoolImpl::Lifeguard::Lifeguard(
                    .set_initial_backoff(kLifeguardMinSleepBetweenChecks)
                    .set_max_backoff(kLifeguardMaxSleepBetweenChecks)
                    .set_multiplier(1.3)),
-      lifeguard_should_shut_down_(std::make_unique<grpc_core::Notification>()),
-      lifeguard_is_shut_down_(std::make_unique<grpc_core::Notification>()) {
-  // lifeguard_running_ is set early to avoid a quiesce race while the
-  // lifeguard is still starting up.
-  lifeguard_running_.store(true);
-
+      lifeguard_should_shut_down_(std::make_unique<grpc_core::Notification>()) {
   grpc_core::BackOff start_backoff(
       grpc_core::BackOff::Options()
           .set_initial_backoff(kLifeguardStartMinSleep)
@@ -403,10 +460,10 @@ WorkStealingThreadPool::WorkStealingThreadPoolImpl::Lifeguard::Lifeguard(
           auto* lifeguard = static_cast<Lifeguard*>(arg);
           lifeguard->LifeguardMain();
         },
-        this, &success,
-        grpc_core::Thread::Options().set_tracked(false).set_joinable(false));
+        this, &success, grpc_core::Thread::Options().set_tracked(false));
     if (success) {
-      thread.Start();
+      thread_ = std::move(thread);
+      thread_.Start();
       break;
     } else if (grpc_core::Timestamp::Now() > deadline) {
       grpc_core::Crash("Failed to start lifeguard thread");
@@ -439,25 +496,11 @@ void WorkStealingThreadPool::WorkStealingThreadPoolImpl::Lifeguard::
         absl::Milliseconds(backoff_.NextAttemptDelay().millis()));
     MaybeStartNewThread();
   }
-  lifeguard_running_.store(false, std::memory_order_relaxed);
-  lifeguard_is_shut_down_->Notify();
 }
 
 WorkStealingThreadPool::WorkStealingThreadPoolImpl::Lifeguard::~Lifeguard() {
   lifeguard_should_shut_down_->Notify();
-  while (lifeguard_running_.load(std::memory_order_relaxed)) {
-    GRPC_LOG_EVERY_N_SEC_DELAYED_DEBUG(
-        kBlockingQuiesceLogRateSeconds, "%s",
-        "Waiting for lifeguard thread to shut down");
-    lifeguard_is_shut_down_->WaitForNotification();
-  }
-  // Do an additional wait in case this method races with LifeguardMain's
-  // shutdown. This should return immediately if the lifeguard is already shut
-  // down.
-  lifeguard_is_shut_down_->WaitForNotification();
-  backoff_.Reset();
-  lifeguard_should_shut_down_ = std::make_unique<grpc_core::Notification>();
-  lifeguard_is_shut_down_ = std::make_unique<grpc_core::Notification>();
+  thread_.Join();
 }
 
 bool WorkStealingThreadPool::WorkStealingThreadPoolImpl::Lifeguard::
@@ -499,6 +542,48 @@ bool WorkStealingThreadPool::WorkStealingThreadPoolImpl::Lifeguard::
 }
 
 // -------- WorkStealingThreadPool::ThreadState --------
+
+thread_local WorkStealingThreadPool::ThreadState*
+    WorkStealingThreadPool::ThreadState::current_ = nullptr;
+
+WorkStealingThreadPool::ThreadState*
+WorkStealingThreadPool::ThreadState::Current(WorkStealingThreadPoolImpl* pool) {
+  return current_ != nullptr && current_->pool_.get() == pool ? current_
+                                                              : nullptr;
+}
+
+void WorkStealingThreadPool::ThreadState::Start() {
+  bool success;
+  thread_.emplace(
+      "event_engine",
+      [](void* arg) {
+        auto* worker = static_cast<ThreadState*>(arg);
+        current_ = worker;
+        worker->ThreadBody();
+        if (worker->thread_.has_value()) {
+          worker->pool_->RetireThread(std::move(*worker->thread_));
+          worker->thread_.reset();
+        }
+        current_ = nullptr;
+        delete worker;
+      },
+      this, &success, grpc_core::Thread::Options().set_tracked(false));
+  GRPC_CHECK(success);
+  thread_->Start();
+}
+
+void WorkStealingThreadPool::ThreadState::ScheduleJoinFromHelper() {
+  // The caller cannot join itself. Transfer its handle without keeping a pool
+  // reference that could destroy the pool on the join helper.
+  bool success;
+  grpc_core::Thread helper(
+      "event_engine_join",
+      [thread = std::move(*thread_)]() mutable { thread.Join(); }, &success,
+      grpc_core::Thread::Options().set_tracked(false).set_joinable(false));
+  GRPC_CHECK(success);
+  thread_.reset();
+  helper.Start();
+}
 
 WorkStealingThreadPool::ThreadState::ThreadState(
     std::shared_ptr<WorkStealingThreadPoolImpl> pool)
@@ -542,6 +627,7 @@ void WorkStealingThreadPool::ThreadState::ThreadBody() {
   GRPC_CHECK(g_local_queue->Empty());
   pool_->theft_registry()->Unenroll(g_local_queue);
   delete g_local_queue;
+  g_local_queue = nullptr;
   if (g_log_verbose_failures) {
     pool_->UntrackThread(gpr_thd_currentid());
   }

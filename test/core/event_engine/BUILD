@@ -54,6 +54,7 @@ grpc_cc_test(
         "//:grpc",
         "//src/core:event_engine_thread_count",
         "//src/core:event_engine_thread_pool",
+        "//src/core:grpc_check",
         "//src/core:notification",
         "//src/core:time",
         "//test/core/test_util:grpc_test_util_unsecure",

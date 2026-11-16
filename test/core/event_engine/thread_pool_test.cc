@@ -26,8 +26,13 @@
 #include <tuple>
 #include <vector>
 
+#ifdef GPR_POSIX_SYNC
+#include <pthread.h>
+#endif
+
 #include "src/core/lib/event_engine/thread_pool/thread_count.h"
 #include "src/core/lib/event_engine/thread_pool/work_stealing_thread_pool.h"
+#include "src/core/util/grpc_check.h"
 #include "src/core/util/notification.h"
 #include "src/core/util/thd.h"
 #include "src/core/util/time.h"
@@ -64,6 +69,165 @@ TYPED_TEST(ThreadPoolTest, CanDestroyInsideClosure) {
   });
   n.WaitForNotification();
 }
+
+#ifdef GPR_POSIX_SYNC
+
+// Holds a worker in pthread cleanup, after its thread body has returned.
+class ThreadExitGate {
+ public:
+  ThreadExitGate() {
+    GRPC_CHECK(pthread_key_create(&key_, [](void* arg) {
+                 auto* gate = static_cast<ThreadExitGate*>(arg);
+                 gate->entered_.Notify();
+                 GRPC_CHECK(gate->release_.WaitForNotificationWithTimeout(
+                     absl::Seconds(60)));
+                 gate->finished_.Notify();
+               }) == 0);
+  }
+  ~ThreadExitGate() { GRPC_CHECK(pthread_key_delete(key_) == 0); }
+
+  void Install() { GRPC_CHECK(pthread_setspecific(key_, this) == 0); }
+  bool WaitForEntry(absl::Duration timeout) {
+    return entered_.WaitForNotificationWithTimeout(timeout);
+  }
+  void Release() {
+    release_.Notify();
+    GRPC_CHECK(finished_.WaitForNotificationWithTimeout(absl::Seconds(60)));
+  }
+
+  template <typename Shutdown>
+  void ExpectShutdownWaits(Shutdown shutdown) {
+    grpc_core::Notification returned;
+    bool returned_while_blocked = false;
+    std::thread controller([&] {
+      GRPC_CHECK(entered_.WaitForNotificationWithTimeout(absl::Seconds(60)));
+      // Release even on a broken implementation, so the test cannot deadlock.
+      returned_while_blocked =
+          returned.WaitForNotificationWithTimeout(absl::Seconds(1));
+      release_.Notify();
+    });
+    shutdown();
+    returned.Notify();
+    controller.join();
+    GRPC_CHECK(finished_.WaitForNotificationWithTimeout(absl::Seconds(60)));
+    EXPECT_FALSE(returned_while_blocked);
+  }
+
+ private:
+  pthread_key_t key_;
+  grpc_core::Notification entered_;
+  grpc_core::Notification release_;
+  grpc_core::Notification finished_;
+};
+
+TYPED_TEST(ThreadPoolTest, QuiesceWaitsForPthreadTlsDestructors) {
+  ThreadExitGate gate;
+  TypeParam pool(1);
+  pool.Run([&] { gate.Install(); });
+  gate.ExpectShutdownWaits([&] { pool.Quiesce(); });
+}
+
+TYPED_TEST(ThreadPoolTest,
+           OtherPoolsWorkerQuiesceWaitsForPthreadTlsDestructors) {
+  ThreadExitGate gate;
+  TypeParam pool(1);
+  TypeParam caller(1);
+  pool.Run([&] { gate.Install(); });
+  gate.ExpectShutdownWaits([&] {
+    grpc_core::Notification done;
+    caller.Run([&] {
+      pool.Quiesce();
+      done.Notify();
+    });
+    done.WaitForNotification();
+  });
+  caller.Quiesce();
+}
+
+TYPED_TEST(ThreadPoolTest, CanDestroyInsideClosureWithPthreadTlsDestructor) {
+  ThreadExitGate peer_gate;
+  ThreadExitGate caller_gate;
+  auto* pool = new TypeParam(2);
+  grpc_core::Notification installed;
+  grpc_core::Notification finish_peer;
+  grpc_core::Notification destroyed;
+  pool->Run([&] {
+    peer_gate.Install();
+    installed.Notify();
+    finish_peer.WaitForNotification();
+  });
+  installed.WaitForNotification();
+  pool->Run([&] {
+    caller_gate.Install();
+    finish_peer.Notify();
+    pool->Quiesce();
+    delete pool;
+    destroyed.Notify();
+  });
+  peer_gate.ExpectShutdownWaits([&] { destroyed.WaitForNotification(); });
+  EXPECT_TRUE(caller_gate.WaitForEntry(absl::Seconds(10)));
+  caller_gate.Release();
+}
+
+TYPED_TEST(ThreadPoolTest, SlowRetiredThreadCleanupDoesNotBlockScaling) {
+  ThreadExitGate gate;
+  TypeParam pool(0);
+  pool.Run([&] { gate.Install(); });
+  // With no reserved workers, this worker retires after the idle timeout.
+  EXPECT_TRUE(gate.WaitForEntry(absl::Seconds(60)));
+  grpc_core::Notification ran;
+  pool.Run([&] { ran.Notify(); });
+  EXPECT_TRUE(ran.WaitForNotificationWithTimeout(absl::Seconds(10)));
+  gate.Release();
+  pool.Quiesce();
+}
+
+TYPED_TEST(ThreadPoolTest, WorkerTlsDestructorsCanRunIndependently) {
+  struct Worker {
+    ThreadExitGate cleanup;
+    grpc_core::Notification installed;
+    grpc_core::Notification finish;
+  } first, second;
+  TypeParam pool(2);
+  for (auto* worker : {&first, &second}) {
+    pool.Run([worker] {
+      worker->cleanup.Install();
+      worker->installed.Notify();
+      worker->finish.WaitForNotification();
+    });
+    worker->installed.WaitForNotification();
+  }
+  std::thread shutdown([&] { pool.Quiesce(); });
+  first.finish.Notify();
+  EXPECT_TRUE(first.cleanup.WaitForEntry(absl::Seconds(10)));
+  second.finish.Notify();
+  // Joining a predecessor on the worker itself would block this destructor.
+  EXPECT_TRUE(second.cleanup.WaitForEntry(absl::Seconds(10)));
+  first.cleanup.Release();
+  second.cleanup.Release();
+  shutdown.join();
+}
+
+#if GRPC_ENABLE_FORK_SUPPORT
+TYPED_TEST(ThreadPoolTest, PrepareForkWaitsForPthreadTlsDestructors) {
+  ThreadExitGate gate;
+  TypeParam pool(1);
+  grpc_core::Notification installed;
+  pool.Run([&] {
+    gate.Install();
+    installed.Notify();
+  });
+  installed.WaitForNotification();
+  gate.ExpectShutdownWaits([&] { pool.PrepareFork(); });
+  pool.PostFork();
+  grpc_core::Notification restarted;
+  pool.Run([&] { restarted.Notify(); });
+  restarted.WaitForNotification();
+  pool.Quiesce();
+}
+#endif  // GRPC_ENABLE_FORK_SUPPORT
+
+#endif  // GPR_POSIX_SYNC
 
 #if GRPC_ENABLE_FORK_SUPPORT
 
@@ -169,6 +333,30 @@ TYPED_TEST(ThreadPoolTest, StartQuiesceRaceStressTest) {
     t2.Start();
     t1.Join();
     t2.Join();
+  }
+}
+
+TYPED_TEST(ThreadPoolTest, RestartQuiesceRaceDrainsSavedWork) {
+  for (size_t reserve_threads : {0, 1}) {
+    for (int i = 0; i < 100; ++i) {
+      TypeParam pool(reserve_threads);
+      pool.PrepareFork();
+      std::atomic<int> ran{0};
+      pool.Run([&] { pool.Run([&] { ++ran; }); });
+      grpc_core::Notification start;
+      std::thread restart([&] {
+        start.WaitForNotification();
+        pool.PostFork();
+      });
+      std::thread shutdown([&] {
+        start.WaitForNotification();
+        pool.Quiesce();
+      });
+      start.Notify();
+      restart.join();
+      shutdown.join();
+      EXPECT_EQ(ran.load(), 1);
+    }
   }
 }
 
